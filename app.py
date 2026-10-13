@@ -273,11 +273,12 @@ if photo and "rows" not in st.session_state:
     rows, raw_text, used_cells = [], [], False
 
     if cells:
-        used_cells = True
-        # распознаём шапку и определяем, где какой столбец
-        header = [cell_ocr(img, b) for b in cells[0]]
-        table = [header]
-        roles = detect_roles_by_header([header])
+       dbg = np.array(img.convert("RGB"))
+    for row in cells:
+        for x1, y1, x2, y2 in row:
+            cv2.rectangle(dbg, (x1, y1), (x2, y2), (255, 0, 0), 2)
+    with st.expander("Как программа видит сетку (для отладки)"):
+        st.image(dbg)
         if roles is None:
             table = [[cell_ocr(img, b) for b in cells[0]] for _ in [0]]  # placeholder
             full = [ [cell_ocr(img, b) for b in row] for row in cells[1:] ]
