@@ -12,10 +12,9 @@ st.set_page_config(page_title="Сверочный лист → слайды", la
 st.title("Сверочный лист → презентация")
 st.caption("Фото таблицы → проверка строк → готовый PPTX")
 
-# ---------- Распознавание ----------
+# ---------- Выравнивание наклона ----------
 
 def deskew(pil_img: Image.Image) -> Image.Image:
-    """Выравнивает наклон фото по горизонтальным линиям таблицы."""
     img = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
@@ -33,28 +32,161 @@ def deskew(pil_img: Image.Image) -> Image.Image:
                            flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
     return Image.fromarray(cv2.cvtColor(fixed, cv2.COLOR_BGR2GRAY))
 
-def crop_table(pil_img: Image.Image):
-    """Обрезает изображение по границам таблицы. Возвращает (кадр, найдена_ли)."""
-    img = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2GRAY)
-    thr = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    h, w = thr.shape
-    # оставляем только длинные горизонтальные и вертикальные линии сетки
-    horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
-                             cv2.getStructuringElement(cv2.MORPH_RECT, (max(2, w // 15), 1)))
-    vert = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
-                            cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(2, h // 15))))
-    grid = cv2.add(horiz, vert)
-    ys, xs = np.where(grid > 0)
-    if len(xs) < 100:            # линий таблицы не видно — оставляем кадр как есть
-        return pil_img, False
-    x1, x2, y1, y2 = xs.min(), xs.max(), ys.min(), ys.max()
-    pad = 10
-    crop = pil_img.crop((max(0, x1 - pad), max(0, y1 - pad),
-                         min(w, x2 + pad), min(h, y2 + pad)))
-    return crop, True
+# ---------- Поиск сетки таблицы ----------
 
-def ocr_lines(pil_img: Image.Image) -> list[str]:
-    """Распознаёт текст и возвращает строки таблицы."""
+def find_grid_cells(pil_img: Image.Image):
+    """Находит линии сетки и возвращает ячейки построчно или None."""
+    img = np.array(pil_img.convert("L"))
+    h, w = img.shape
+    thr = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    kx = max(30, w // 12)
+    ky = max(20, h // 20)
+    horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)))
+    vert = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky)))
+    vproj = (vert > 0).sum(axis=0)
+    xs = [x for x in range(w) if vproj[x] > h * 0.25]
+    vpos = []
+    for x in xs:
+        if not vpos or x - vpos[-1][-1] > 10:
+            vpos.append([x])
+        else:
+            vpos[-1].append(x)
+    vpos = [int(np.mean(g)) for g in vpos]
+    hproj = (horiz > 0).sum(axis=1)
+    ys = [y for y in range(h) if hproj[y] > w * 0.5]
+    hpos = []
+    for y in ys:
+        if not hpos or y - hpos[-1][-1] > 10:
+            hpos.append([y])
+        else:
+            hpos[-1].append(y)
+    hpos = [int(np.mean(g)) for g in hpos]
+    if len(vpos) < 4 or len(hpos) < 3:
+        return None
+    cells = []
+    for r in range(len(hpos) - 1):
+        y1, y2 = hpos[r], hpos[r + 1]
+        if y2 - y1 < 18:
+            continue
+        row = []
+        for c in range(len(vpos) - 1):
+            x1, x2 = vpos[c], vpos[c + 1]
+            if x2 - x1 < 15:
+                continue
+            row.append((x1 + 2, y1 + 2, x2 - 2, y2 - 2))
+        cells.append(row)
+    return cells if cells else None
+
+def cell_ocr(pil_img: Image.Image, box) -> str:
+    x1, y1, x2, y2 = box
+    crop = pil_img.crop((x1, y1, x2, y2))
+    crop = crop.resize((crop.width * 3, crop.height * 3))
+    txt = pytesseract.image_to_string(crop, lang="rus", config="--psm 7").strip()
+    if not txt:
+        txt = pytesseract.image_to_string(crop, lang="rus", config="--psm 6").strip()
+    return re.sub(r"[|_]+", "", txt).strip()
+
+# ---------- Классификация колонок ----------
+
+place_re = re.compile(
+    r'^\s*(?:[МмMмГгРрP№TтТ]\s*[-–—.]?\s*\d{1,2}\s*[-–—.]?\s*\d{1,2}\s*[-–—.]?\s*\d{1,2}\s*[-–—.]?'
+    r'(?:\d{1,4}|[А-Яа-яЁёA-Za-z]{1,2})'
+    r'|\d{1,2}\s*[-–—.]\s*\d{1,2}\s*[-–—.]\s*\d{1,2}\s*[-–—.]\s*(?:\d{1,4}|[А-Яа-яЁё]{1,2}))\s*$'
+)
+lot_re = re.compile(r'^\s*[АВСДЕFавесдa-fA-F]\s*$')
+qty_re = re.compile(r'^\s*\d{1,3}\s*$')
+series_re = re.compile(r'^\s*([А-ЯЁA-Zа-яёa-z]{0,3}\d{3,}[А-ЯЁA-Zа-яё]?[./]\d{1,3}[\w./-]*)\s*$')
+rest_re = re.compile(r"\d+\s*\*\s*$\d+$\s*\+\s*\d+")
+
+def detect_roles_by_header(table):
+    header = [t.lower() for t in table[0]]
+    roles = {}
+    for j, t in enumerate(header):
+        if "место" in t: roles["place"] = j
+        elif "кол" in t: roles["qty"] = j
+        elif "лот" in t: roles["lot"] = j
+        elif "наимен" in t: roles["name"] = j
+        elif "сери" in t: roles["series"] = j
+        elif "остат" in t: roles["rest"] = j
+    need = {"place", "qty", "lot", "name"}
+    return roles if need <= roles.keys() else None
+
+def detect_roles_heuristic(table):
+    ncols = min(len(r) for r in table)
+    body = table[1:]
+    stats = []
+    for j in range(ncols):
+        vals = [r[j] for r in body if j < len(r) and r[j].strip()]
+        if not vals:
+            stats.append(None)
+            continue
+        stats.append(dict(
+            place=sum(bool(place_re.fullmatch(v)) for v in vals) / len(vals),
+            lot=sum(bool(lot_re.fullmatch(v)) for v in vals) / len(vals),
+            num=sum(bool(qty_re.fullmatch(v)) for v in vals) / len(vals),
+            series=sum(bool(series_re.fullmatch(v)) for v in vals) / len(vals),
+            rest=sum(bool(rest_re.search(v)) for v in vals) / len(vals),
+            avg_len=sum(len(v) for v in vals) / len(vals),
+        ))
+    roles = {}
+    best = max(range(ncols), key=lambda j: (stats[j] or {}).get("lot", -1))
+    if stats[best] and stats[best]["lot"] >= 0.5: roles["lot"] = best
+    best = max(range(ncols), key=lambda j: (stats[j] or {}).get("place", -1))
+    if stats[best] and stats[best]["place"] >= 0.5: roles["place"] = best
+    cands = [j for j in range(ncols) if j not in roles.values()]
+    best = max(cands, key=lambda j: (stats[j] or {}).get("series", -1))
+    if stats[best] and stats[best]["series"] >= 0.5: roles["series"] = best
+    for j in cands:
+        if stats[j] and stats[j]["rest"] >= 0.5:
+            roles["rest"] = j
+            break
+    nums = [j for j in range(ncols)
+            if j not in roles.values() and stats[j] and stats[j]["num"] >= 0.5]
+    if len(nums) >= 2:
+        roles["num"], roles["qty"] = nums[0], nums[1]
+    elif len(nums) == 1:
+        roles["qty"] = nums[0]
+    cands = [j for j in range(ncols) if j not in roles.values()]
+    if cands:
+        best = max(cands, key=lambda j: (stats[j] or {}).get("avg_len", -1))
+        if stats[best] and stats[best]["avg_len"] >= 8: roles["name"] = best
+    need = {"place", "qty", "lot", "name"}
+    return roles if need <= roles.keys() else None
+
+def normalize_place(place: str) -> str:
+    place = place.strip()
+    if not place:
+        return ""
+    first = place[0]
+    if first in "№МмMm": place = "М" + place[1:]
+    elif first in "Гг": place = "Г" + place[1:]
+    elif first in "РрPp": place = "Р" + place[1:]
+    return place.replace(" ", "")
+
+def assemble_rows(table, roles):
+    rows = []
+    for row in table[1:]:
+        def get(role):
+            j = roles.get(role)
+            return row[j].strip() if j is not None and j < len(row) else ""
+        place = normalize_place(get("place"))
+        qty = re.sub(r"\D", "", get("qty"))
+        lot = get("lot")[:1].upper()
+        name = get("name").strip(" ,;")
+        series = get("series").replace(" ", "")
+        # из наименования — только первые три слова
+        name = " ".join(name.split()[:3])
+        valid = bool(place_re.fullmatch(place)) or (qty and lot)
+        if name and valid:
+            rows.append({"Наименование": name, "Место": place, "Серия": series,
+                         "Кол-во": qty, "Лоток": lot})
+    return rows
+
+# ---------- Запасной путь: сплошной OCR (если сетка не найдена) ----------
+
+def ocr_lines(pil_img: Image.Image) -> list:
     big = pil_img.resize((pil_img.width * 2, pil_img.height * 2))
     data = pytesseract.image_to_data(big, lang="rus", config="--psm 6",
                                      output_type=pytesseract.Output.DATAFRAME)
@@ -69,47 +201,40 @@ def ocr_lines(pil_img: Image.Image) -> list[str]:
     lines.sort(key=lambda t: t[0])
     return [t for _, t in lines]
 
-# ---------- Разбор строк (столбец «Остаток» не учитывается) ----------
-
-place_pat = r"[мгрМГРMGP][-–—.]\d{1,2}[-–—.]\d{1,2}[-–—.]\d{1,2}[-–—.][А-Яа-яЁёA-Za-z0-9]{1,2}"
 main_re = re.compile(
     r"^\s*(?:(\d{1,2})\s+)?"
-    rf"({place_pat})\s+"
+    r"([МмMмГгРрP№][-–—.]?\d{1,2}[-–—.]?\d{1,2}[-–—.]?\d{1,2}[-–—.]?(?:\d{1,4}|[А-Яа-яЁёA-Za-z]{1,2}))\s+"
     r"(\d{1,3})\s*"
     r"([АВЕСДA-Fa-fавесд])\b\s*"
     r"(.*)$"
 )
 nopl_re = re.compile(r"^\s*(\d{1,2})\s+(\d{1,3})\s+([АВЕСДA-Fa-fавесд])\b\s+(.*)$")
-series_re = re.compile(r"([А-ЯЁA-Zа-яёa-z]{0,3}\d{3,}[А-ЯЁA-Zа-яё]?[./]\d{1,3}[\w./-]*)")
-rest_re = re.compile(r"\d+\s*\*\s*$\d+$\s*\+\s*\d+")
 
-def parse(line: str):
-    m = main_re.match(line)
-    if m:
-        _, place, qty, lot, tail = m.groups()
-    else:
-        m2 = nopl_re.match(line)
-        if not m2:
-            return None
-        _, qty, lot, tail = m2.groups()
-        place = ""
-    tail = rest_re.sub("", tail).strip()
-    sm = series_re.search(tail)
-    if sm:
-        series = re.sub(r"^[а-яёa-z](?=\d)", "", sm.group(1))
-        name = tail[: sm.start()].strip(" ,;")
-    else:
-        series, name = "", tail.strip(" ,;")
-    # из наименования берём только первые три слова
-    name = " ".join(name.split()[:3])
-    if not name:
-        return None
-    return {"Наименование": name, "Место": place, "Серия": series,
-            "Кол-во": qty, "Лоток": lot.upper()}
+def parse_fallback(lines):
+    rows = []
+    for line in lines:
+        tail = rest_re.sub("", line).strip()
+        m = main_re.match(tail)
+        if not m:
+            m2 = nopl_re.match(tail)
+            if not m2:
+                continue
+            _, qty, lot, tail = m2.groups()
+            place = ""
+        else:
+            _, place, qty, lot, tail = m.groups()
+        sm = series_re.search(tail)
+        series = sm.group(1) if sm else ""
+        name = tail[:sm.start()].strip(" ,;") if sm else tail.strip(" ,;")
+        name = " ".join(name.split()[:3])
+        if name:
+            rows.append({"Наименование": name, "Место": place, "Серия": series,
+                         "Кол-во": qty, "Лоток": lot.upper()})
+    return rows
 
 # ---------- Сборка презентации ----------
 
-def build_pptx(rows: list[dict]) -> bytes:
+def build_pptx(rows) -> bytes:
     prs = Presentation()
     prs.slide_width = Inches(13.33)
     prs.slide_height = Inches(7.5)
@@ -143,29 +268,53 @@ if photo is None:
     photo = st.file_uploader("…или загрузите фото", type=["jpg", "jpeg", "png"])
 
 if photo and "rows" not in st.session_state:
-    with st.spinner("Распознаю таблицу…"):
-        img = deskew(Image.open(photo))
-        img, table_found = crop_table(img)
+    img = deskew(Image.open(photo))
+    cells = find_grid_cells(img)
+    rows, raw_text, used_cells = [], [], False
+
+    if cells:
+        used_cells = True
+        # распознаём шапку и определяем, где какой столбец
+        header = [cell_ocr(img, b) for b in cells[0]]
+        table = [header]
+        roles = detect_roles_by_header([header])
+        if roles is None:
+            table = [[cell_ocr(img, b) for b in cells[0]] for _ in [0]]  # placeholder
+            full = [ [cell_ocr(img, b) for b in row] for row in cells[1:] ]
+            table = [header] + full
+            roles = detect_roles_heuristic(table)
+            raw_text = [" | ".join(r) for r in table]
+        if roles is not None:
+            need = [roles[k] for k in ("place", "qty", "lot", "name", "series") if k in roles]
+            bar = st.progress(0.0)
+            for i, row_cells in enumerate(cells[1:], 1):
+                vals = {j: cell_ocr(img, row_cells[j])
+                        for j in need if j < len(row_cells)}
+                table_row = [vals.get(j, "") for j in range(max(need) + 1)]
+                table.append(table_row)
+                bar.progress(i / max(1, len(cells) - 1))
+            rows = assemble_rows(table, roles)
+    if not rows:
         lines = ocr_lines(img)
-        rows = [p for p in (parse(l) for l in lines) if p]
+        raw_text = lines
+        rows = parse_fallback(lines)
+
     if not rows:
         st.error("Строки не распознаны. Снимите лист ровнее, сверху и при хорошем свете.")
         with st.expander("Что увидел OCR (для отладки)"):
-            st.text("\n".join(lines))
+            st.text("\n".join(raw_text) or "(пусто)")
     else:
         st.session_state.rows = rows
         msg = f"Распознано строк: {len(rows)}"
-        if table_found:
-            msg += " · таблица найдена, лишнее за её границами отсечено"
-        else:
-            st.warning("Рамку таблицы найти не удалось — распознаю весь кадр. Снимайте лист крупнее, чтобы рамка попадала в кадр целиком.")
-        st.success(msg)
+        st.success(msg + (" · распознавание по ячейкам таблицы" if used_cells
+                          else " · по сплошному тексту (сетка не найдена)"))
+        with st.expander("Что увидел OCR (для отладки)"):
+            st.text("\n".join(raw_text) or "(пусто)")
 
 if "rows" in st.session_state:
     st.subheader("Проверьте строки — правьте прямо в таблице")
     edited = st.data_editor(st.session_state.rows,
-                            num_rows="dynamic", use_container_width=True,
-                            column_config={"Лоток": st.column_config.Column(width="small")})
+                            num_rows="dynamic", use_container_width=True)
     st.session_state.rows = edited
 
     if st.button("📄 Собрать презентацию", type="primary"):
