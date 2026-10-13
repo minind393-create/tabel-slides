@@ -38,31 +38,34 @@ def find_grid_cells(pil_img: Image.Image):
     """Находит линии сетки и возвращает ячейки построчно или None."""
     img = np.array(pil_img.convert("L"))
     h, w = img.shape
-    thr = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    kx = max(30, w // 12)
-    ky = max(20, h // 20)
+    blur = cv2.GaussianBlur(img, (3, 3), 0)
+    thr = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY_INV, 35, 15)
+    kx = max(25, w // 18)
+    ky = max(15, h // 30)
     horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
                              cv2.getStructuringElement(cv2.MORPH_RECT, (kx, 1)))
     vert = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
                             cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky)))
+    horiz = cv2.morphologyEx(horiz, cv2.MORPH_CLOSE,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (kx // 2, 1)))
+    vert = cv2.morphologyEx(vert, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (1, ky // 2)))
+
+    def group(vals, gap=15):
+        out = []
+        for v in vals:
+            if not out or v - out[-1][-1] > gap:
+                out.append([v])
+            else:
+                out[-1].append(v)
+        return [int(np.mean(g)) for g in out]
+
     vproj = (vert > 0).sum(axis=0)
-    xs = [x for x in range(w) if vproj[x] > h * 0.25]
-    vpos = []
-    for x in xs:
-        if not vpos or x - vpos[-1][-1] > 10:
-            vpos.append([x])
-        else:
-            vpos[-1].append(x)
-    vpos = [int(np.mean(g)) for g in vpos]
+    vpos = group([x for x in range(w) if vproj[x] > h * 0.20])
     hproj = (horiz > 0).sum(axis=1)
-    ys = [y for y in range(h) if hproj[y] > w * 0.5]
-    hpos = []
-    for y in ys:
-        if not hpos or y - hpos[-1][-1] > 10:
-            hpos.append([y])
-        else:
-            hpos[-1].append(y)
-    hpos = [int(np.mean(g)) for g in hpos]
+    hpos = group([y for y in range(h) if hproj[y] > w * 0.25])
+
     if len(vpos) < 4 or len(hpos) < 3:
         return None
     cells = []
@@ -91,14 +94,23 @@ def cell_ocr(pil_img: Image.Image, box) -> str:
 # ---------- Классификация колонок ----------
 
 place_re = re.compile(
-    r'^\s*(?:[МмMмГгРрP№TтТ]\s*[-–—.]?\s*\d{1,2}\s*[-–—.]?\s*\d{1,2}\s*[-–—.]?\s*\d{1,2}\s*[-–—.]?'
-    r'(?:\d{1,4}|[А-Яа-яЁёA-Za-z]{1,2})'
-    r'|\d{1,2}\s*[-–—.]\s*\d{1,2}\s*[-–—.]\s*\d{1,2}\s*[-–—.]\s*(?:\d{1,4}|[А-Яа-яЁё]{1,2}))\s*$'
+    r"^\s*[МмГгРрPp№]?\s*[-–—.]?\s*\d{1,2}(?:\s*[-–—.]\s*\d{1,2}){1,3}\s*[-–—.]"
+    r"\s*(?:\d{1,4}[А-Яа-яЁёA-Za-z]?|[А-Яа-яЁёA-Za-z]{1,2})\s*$"
 )
-lot_re = re.compile(r'^\s*[АВСДЕFавесдa-fA-F]\s*$')
-qty_re = re.compile(r'^\s*\d{1,3}\s*$')
-series_re = re.compile(r'^\s*([А-ЯЁA-Zа-яёa-z]{0,3}\d{3,}[А-ЯЁA-Zа-яё]?[./]\d{1,3}[\w./-]*)\s*$')
+lot_re = re.compile(r"^\s*[А-ЯЁA-Zа-яёa-z]\s*$")
+qty_re = re.compile(r"^\s*\d{1,3}\s*$")
+series_re = re.compile(r"^\s*([А-ЯЁA-Zа-яёa-z]{0,3}\d{3,}[А-ЯЁA-Zа-яё]?[./]\d{1,3}[\w./-]*)\s*$")
 rest_re = re.compile(r"\d+\s*\*\s*$\d+$\s*\+\s*\d+")
+
+def normalize_place(place: str) -> str:
+    place = place.strip()
+    if not place:
+        return ""
+    first = place[0]
+    if first in "№МмMm": place = "М" + place[1:]
+    elif first in "Гг": place = "Г" + place[1:]
+    elif first in "РрPp": place = "Р" + place[1:]
+    return place.replace(" ", "")
 
 def detect_roles_by_header(table):
     header = [t.lower() for t in table[0]]
@@ -155,16 +167,6 @@ def detect_roles_heuristic(table):
     need = {"place", "qty", "lot", "name"}
     return roles if need <= roles.keys() else None
 
-def normalize_place(place: str) -> str:
-    place = place.strip()
-    if not place:
-        return ""
-    first = place[0]
-    if first in "№МмMm": place = "М" + place[1:]
-    elif first in "Гг": place = "Г" + place[1:]
-    elif first in "РрPp": place = "Р" + place[1:]
-    return place.replace(" ", "")
-
 def assemble_rows(table, roles):
     rows = []
     for row in table[1:]:
@@ -203,12 +205,12 @@ def ocr_lines(pil_img: Image.Image) -> list:
 
 main_re = re.compile(
     r"^\s*(?:(\d{1,2})\s+)?"
-    r"([МмMмГгРрP№][-–—.]?\d{1,2}[-–—.]?\d{1,2}[-–—.]?\d{1,2}[-–—.]?(?:\d{1,4}|[А-Яа-яЁёA-Za-z]{1,2}))\s+"
+    r"([МмМГгРрP№][-–—.]?\d{1,2}[-–—.]?\d{1,2}[-–—.]?\d{1,2}[-–—.]?(?:\d{1,4}|[А-Яа-яЁёA-Za-z]{1,2}))\s+"
     r"(\d{1,3})\s*"
-    r"([АВЕСДA-Fa-fавесд])\b\s*"
+    r"([АВЕСДA-Fa-fавесдА-Я])\b\s*"
     r"(.*)$"
 )
-nopl_re = re.compile(r"^\s*(\d{1,2})\s+(\d{1,3})\s+([АВЕСДA-Fa-fавесд])\b\s+(.*)$")
+nopl_re = re.compile(r"^\s*(\d{1,2})\s+(\d{1,3})\s+([АВЕСДA-Fa-fавесдА-Я])\b\s+(.*)$")
 
 def parse_fallback(lines):
     rows = []
@@ -270,19 +272,53 @@ if photo is None:
 if photo and "rows" not in st.session_state:
     img = deskew(Image.open(photo))
     cells = find_grid_cells(img)
-    rows, raw_text, used_cells, roles = [], [], False, None  # roles теперь инициализируется как None
+    rows, raw_text, used_cells, roles = [], [], False, None   # roles объявлена заранее
 
     if cells:
-        # Дальнейшая обработка, если сетка найдена
-        for row in cells[1:]:
-            # Ваш код обработки ячеек
-            pass
-    else:
-        # Запасной путь, если сетка не найдена
-        full = [[cell_ocr(img, b) for b in row] for row in cells[1:]]
-        table = [header] + full
+        used_cells = True
+        # отладочная картинка: как программа видит сетку
+        dbg = np.array(img.convert("RGB"))
+        for row in cells:
+            for x1, y1, x2, y2 in row:
+                cv2.rectangle(dbg, (x1, y1), (x2, y2), (255, 0, 0), 2)
+        with st.expander("Как программа видит сетку (для отладки)"):
+            st.image(dbg)
+
+        # распознаём все ячейки таблицы
+        bar = st.progress(0.0)
+        total = sum(len(row) for row in cells)
+        done = 0
+        table = []
+        for row_cells in cells:
+            table.append([cell_ocr(img, b) for b in row_cells])
+            done += len(row_cells)
+            bar.progress(min(1.0, done / max(1, total)))
         raw_text = [" | ".join(r) for r in table]
-        roles = detect_roles_heuristic(table)
+
+        # определяем колонки: сначала по шапке, потом по содержимому
+        roles = detect_roles_by_header(table)
+        if roles is None:
+            roles = detect_roles_heuristic(table)
+        if roles is not None:
+            rows = assemble_rows(table, roles)
+
+    if not rows:
+        # запасной путь: сплошной OCR по всему кадру
+        lines = ocr_lines(img)
+        raw_text = lines
+        rows = parse_fallback(lines)
+
+    if not rows:
+        st.error("Строки не распознаны. Снимите лист ровнее, сверху и при хорошем свете.")
+        with st.expander("Что увидел OCR (для отладки)"):
+            st.text("\n".join(raw_text) or "(пусто)")
+    else:
+        st.session_state.rows = rows
+        msg = f"Распознано строк: {len(rows)}"
+        msg += " · по ячейкам таблицы" if used_cells else " · по сплошному тексту (сетка не найдена)"
+        st.success(msg)
+        with st.expander("Что увидел OCR (для отладки)"):
+            st.text("\n".join(raw_text) or "(пусто)")
 
 if "rows" in st.session_state:
     st.subheader("Проверьте строки — правьте прямо в таблице")
