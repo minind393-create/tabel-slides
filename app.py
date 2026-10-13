@@ -33,6 +33,26 @@ def deskew(pil_img: Image.Image) -> Image.Image:
                            flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
     return Image.fromarray(cv2.cvtColor(fixed, cv2.COLOR_BGR2GRAY))
 
+def crop_table(pil_img: Image.Image):
+    """Обрезает изображение по границам таблицы. Возвращает (кадр, найдена_ли)."""
+    img = cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2GRAY)
+    thr = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    h, w = thr.shape
+    # оставляем только длинные горизонтальные и вертикальные линии сетки
+    horiz = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (max(2, w // 15), 1)))
+    vert = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
+                            cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(2, h // 15))))
+    grid = cv2.add(horiz, vert)
+    ys, xs = np.where(grid > 0)
+    if len(xs) < 100:            # линий таблицы не видно — оставляем кадр как есть
+        return pil_img, False
+    x1, x2, y1, y2 = xs.min(), xs.max(), ys.min(), ys.max()
+    pad = 10
+    crop = pil_img.crop((max(0, x1 - pad), max(0, y1 - pad),
+                         min(w, x2 + pad), min(h, y2 + pad)))
+    return crop, True
+
 def ocr_lines(pil_img: Image.Image) -> list[str]:
     """Распознаёт текст и возвращает строки таблицы."""
     big = pil_img.resize((pil_img.width * 2, pil_img.height * 2))
@@ -80,6 +100,8 @@ def parse(line: str):
         name = tail[: sm.start()].strip(" ,;")
     else:
         series, name = "", tail.strip(" ,;")
+    # из наименования берём только первые три слова
+    name = " ".join(name.split()[:3])
     if not name:
         return None
     return {"Наименование": name, "Место": place, "Серия": series,
@@ -123,6 +145,7 @@ if photo is None:
 if photo and "rows" not in st.session_state:
     with st.spinner("Распознаю таблицу…"):
         img = deskew(Image.open(photo))
+        img, table_found = crop_table(img)
         lines = ocr_lines(img)
         rows = [p for p in (parse(l) for l in lines) if p]
     if not rows:
@@ -131,7 +154,12 @@ if photo and "rows" not in st.session_state:
             st.text("\n".join(lines))
     else:
         st.session_state.rows = rows
-        st.success(f"Распознано строк: {len(rows)}")
+        msg = f"Распознано строк: {len(rows)}"
+        if table_found:
+            msg += " · таблица найдена, лишнее за её границами отсечено"
+        else:
+            st.warning("Рамку таблицы найти не удалось — распознаю весь кадр. Снимайте лист крупнее, чтобы рамка попадала в кадр целиком.")
+        st.success(msg)
 
 if "rows" in st.session_state:
     st.subheader("Проверьте строки — правьте прямо в таблице")
